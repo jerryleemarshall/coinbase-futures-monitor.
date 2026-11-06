@@ -5,6 +5,7 @@ import json
 import math
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -16,6 +17,10 @@ HEADERS = {'User-Agent': 'CoinbaseFuturesMonitor/2.0', 'Accept': 'application/js
 MAX_CONTRACTS = int(os.getenv('MAX_CONTRACTS', '500'))
 MAX_PAGES = int(os.getenv('MAX_PAGES', '30'))
 MAX_AGE_MINUTES = 90
+WORKERS = max(1, min(int(os.getenv('WORKERS', '5')), 8))
+# -CDE identifies Coinbase Derivatives Exchange contracts in observed public listings.
+# It is a venue filter, NOT proof of account-specific US trading eligibility.
+CDE_SUFFIX = '-CDE'
 
 
 def get_json(path, params=None):
@@ -40,7 +45,7 @@ def discover():
         batch = data.get('products') or []
         for item in batch:
             pid = item.get('product_id', '')
-            if pid and pid not in seen and (pid.endswith('-CDE') or item.get('product_type') == 'FUTURE'):
+            if pid and pid not in seen and item.get('product_type') == 'FUTURE':
                 seen.add(pid)
                 products.append(item)
                 if len(products) >= MAX_CONTRACTS:
@@ -148,46 +153,101 @@ def assess(fifteen, hourly, now):
     return result
 
 
+def classify_us_candidate(product, now):
+    """Conservative venue/status screen; account-specific eligibility remains unverified."""
+    pid = product.get('product_id', '')
+    if not pid.endswith(CDE_SUFFIX):
+        return False, 'Not identified as Coinbase Derivatives Exchange (-CDE) contract'
+    status = str(product.get('status') or '').lower()
+    if status and status not in ('online', 'active'):
+        return False, f'Non-active product status: {status}'
+    for flag in ('trading_disabled', 'is_disabled', 'cancel_only', 'limit_only', 'post_only'):
+        if product.get(flag) is True:
+            return False, f'Product restriction: {flag}'
+    # Coinbase product metadata can vary; do not infer an expiration when absent.
+    details = product.get('future_product_details') or {}
+    expiry = details.get('contract_expiry') or details.get('contract_expiration') or product.get('contract_expiry')
+    if expiry:
+        try:
+            date = datetime.fromisoformat(str(expiry).replace('Z', '+00:00'))
+            if date.tzinfo is None:
+                date = date.replace(tzinfo=timezone.utc)
+            if date.timestamp() <= now:
+                return False, 'Expired contract'
+        except (ValueError, TypeError):
+            pass
+    return True, 'CDE venue candidate; account eligibility and margin NOT verified'
+
+
+def scan_one(product, now):
+    pid = product['product_id']
+    entry = {'product_id': pid, 'display_name': product.get('display_name'),
+             'status': product.get('status'), 'price': product.get('price'),
+             'us_venue_candidate': True,
+             'us_account_eligible': None,
+             'eligibility_note': 'Public data cannot establish account-specific tradability',
+             'product_metadata': product,
+             'candles_15m': [], 'candles_1h': [],
+             'analysis': {'decision': 'PASS', 'reason': 'Not processed'}}
+    try:
+        entry['candles_15m'] = candles(pid, 'FIFTEEN_MINUTE', 900, 100, now)
+        entry['candles_1h'] = candles(pid, 'ONE_HOUR', 3600, 100, now)
+        entry['analysis'] = assess(entry['candles_15m'], entry['candles_1h'], now)
+        return entry, None
+    except Exception as exc:
+        entry['analysis'] = {'decision': 'PASS', 'reason': 'API/data error'}
+        return entry, {'product_id': pid, 'error': str(exc)[:300]}
+
+
 def main():
     now = int(time.time())
     report = {'generated_at': datetime.fromtimestamp(now, timezone.utc).isoformat(),
-              'scanner_version': '2.0', 'analysis_only': True,
-              'notes': ['All levels are references, not orders or trade recommendations.',
-                        'No bid/ask spread, fee, tick value, margin or account-specific risk checks.',
-                        'Candle volume may not be comparable between contracts.'],
-              'contracts_discovered': 0, 'discovery_truncated': False, 'contracts_processed': 0,
-              'errors': [], 'results': [], 'ranked_watchlist': []}
+              'scanner_version': '2.1-us-cde', 'analysis_only': True,
+              'scope': 'Coinbase Derivatives Exchange (-CDE) public futures candidates',
+              'notes': ['CDE suffix is a venue indicator, not confirmation of US account eligibility.',
+                        'Account-level permissions, margins, tick values, bid/ask spreads and fees are unverified.',
+                        'All trade levels are hypothetical references, never executable recommendations.',
+                        'Only completed OHLCV candles are saved; missing or stale data is PASS.'],
+              'contracts_discovered': 0, 'discovery_truncated': False,
+              'us_venue_candidates': 0, 'contracts_processed': 0,
+              'excluded_products': [], 'errors': [], 'results': [], 'ranked_watchlist': []}
     try:
         products, truncated = discover()
         report['contracts_discovered'] = len(products)
         report['discovery_truncated'] = truncated
-        print(f'Discovered {len(products)} futures contracts; truncated={truncated}', flush=True)
-        for i, product in enumerate(products, 1):
-            pid = product['product_id']
-            entry = {'product_id': pid, 'display_name': product.get('display_name'),
-                     'status': product.get('status'), 'price': product.get('price'),
-                     'candles_15m': [], 'candles_1h': [], 'analysis': {'decision': 'PASS', 'reason': 'Not processed'}}
-            try:
-                entry['candles_15m'] = candles(pid, 'FIFTEEN_MINUTE', 900, 100, now)
-                entry['candles_1h'] = candles(pid, 'ONE_HOUR', 3600, 100, now)
-                entry['analysis'] = assess(entry['candles_15m'], entry['candles_1h'], now)
-            except Exception as exc:
-                entry['analysis'] = {'decision': 'PASS', 'reason': 'API/data error'}
-                report['errors'].append({'product_id': pid, 'error': str(exc)[:300]})
-            report['results'].append(entry)
-            report['contracts_processed'] += 1
-            if i % 20 == 0:
-                print(f'Processed {i}/{len(products)}', flush=True)
+        eligible = []
+        for product in products:
+            included, reason = classify_us_candidate(product, now)
+            if included:
+                eligible.append(product)
+            else:
+                report['excluded_products'].append({'product_id': product.get('product_id'), 'reason': reason})
+        report['us_venue_candidates'] = len(eligible)
+        print(f'Discovered {len(products)} futures; CDE candidates={len(eligible)}; truncated={truncated}', flush=True)
+        with ThreadPoolExecutor(max_workers=WORKERS) as pool:
+            futures = {pool.submit(scan_one, product, now): product['product_id'] for product in eligible}
+            for future in as_completed(futures):
+                entry, error = future.result()
+                report['results'].append(entry)
+                report['contracts_processed'] += 1
+                if error:
+                    report['errors'].append(error)
+                if report['contracts_processed'] % 25 == 0:
+                    print(f"Processed {report['contracts_processed']}/{len(eligible)}", flush=True)
+        report['results'].sort(key=lambda x: x['product_id'])
     except Exception as exc:
-        report['errors'].append({'stage': 'discovery', 'error': str(exc)[:300]})
-    report['ranked_watchlist'] = sorted(({'product_id': r['product_id'], 'display_name': r['display_name'], **r['analysis']}
-                                          for r in report['results'] if r['analysis']['decision'] == 'CONDITIONAL'),
-                                         key=lambda x: x['score'], reverse=True)[:20]
+        report['errors'].append({'stage': 'discovery/scan', 'error': str(exc)[:300]})
+    report['ranked_watchlist'] = sorted(
+        ({'product_id': r['product_id'], 'display_name': r['display_name'], **r['analysis']}
+         for r in report['results'] if r['analysis'].get('decision') == 'CONDITIONAL'),
+        key=lambda x: x['score'], reverse=True)[:20]
     Path('futures_report.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
-    print(f"Done: {report['contracts_processed']} scanned, {len(report['ranked_watchlist'])} conditional, "
-          f"{len(report['errors'])} errors. Report: futures_report.json", flush=True)
+    print(f"Done: {report['contracts_processed']} CDE candidates scanned, "
+          f"{len(report['ranked_watchlist'])} conditional, {len(report['errors'])} errors", flush=True)
+    if report['contracts_processed'] == 0:
+        raise RuntimeError('No CDE contracts scanned; inspect report and public API eligibility fields')
 
 
 if __name__ == '__main__':
     main()
-        
+    
