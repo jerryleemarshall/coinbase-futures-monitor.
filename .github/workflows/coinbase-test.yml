@@ -1,29 +1,31 @@
-# Coinbase futures API test
-name: Coinbase Futures API Test
+
+name: Coinbase Futures Market Scan
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
   schedule:
     - cron: '*/15 * * * *'
-   
+
+permissions:
+  contents: read
 
 jobs:
-  test-coinbase:
+  scan:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Test Coinbase API
+      - name: Scan public Coinbase futures market data
         run: python coinbase_scan.py
-        
-      - name: Save futures scan report
+      - name: Upload scan report
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: futures-report
           path: futures_report.json
           retention-days: 7
+          if-no-files-found: warn
           
