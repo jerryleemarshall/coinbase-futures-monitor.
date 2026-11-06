@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
   schedule:
     - cron: '*/15 * * * *'
-    
+   
 
 jobs:
   test-coinbase:
@@ -20,3 +20,10 @@ jobs:
       - name: Test Coinbase API
         run: python coinbase_scan.py
         
+      - name: Save futures scan report
+        uses: actions/upload-artifact@v4
+        with:
+          name: futures-report
+          path: futures_report.json
+          retention-days: 7
+          
