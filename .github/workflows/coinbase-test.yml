@@ -15,5 +15,5 @@ jobs:
         with:
           python-version: '3.11'
       - name: Test Coinbase API
-        run: python coinbase_test.py
+        run: python coinbase_scan.py
         
